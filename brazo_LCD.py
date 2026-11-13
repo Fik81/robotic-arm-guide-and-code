@@ -6,6 +6,7 @@ Conexiones:
   LCD 16x2:    VCC -> pin 2 (5V)   | SDA -> pin 27 | SCL -> pin 28 | GND -> pin 9   (bus I2C 0)
 
 Uso: presiona Enter, di un comando (se graba SEG segundos) y el brazo lo ejecuta.
+Si el reconocimiento tarda más de TIEMPO_MAX_RECONOCIMIENTO segundos, se vuelve a pedir el comando.
 En el teclado:  Enter = hablar | h = ayuda | q = salir
 La LCD es opcional: si no se encuentra o falla, el programa sigue solo en consola.
 """
@@ -34,6 +35,10 @@ MIC_RESPALDO = 11       # índice a usar si no se encuentra por nombre
 SR_WHISPER = 16000      # frecuencia que espera Whisper
 SEG = 3                 # segundos que se graba por comando
 
+# --- Tiempo máximo de reconocimiento ---
+TIEMPO_MAX_RECONOCIMIENTO = 8   # si pasa de estos segundos sin detectar, se vuelve a pedir
+REINTENTOS_MAX = 3              # veces que se pide el comando antes de volver al menú
+
 # --- LCD 16x2 I2C ---
 USAR_LCD = True                 
 LCD_PUERTO = 0                  
@@ -44,7 +49,7 @@ CUENTA_REGRESIVA = 3            # "Habla en 3, 2, 1"
 TIEMPO_AYUDA = 3                # segundos que se ve cada pantalla de la ayuda
 TIEMPO_RESULTADO = 3            # segundos que se ve el resultado antes de volver al menú
 
-# Pantallas de la ayuda: dos comandos por pantalla (máximo 16 letras por línea)
+# Pantallas de la ayuda
 AYUDA_LCD = [
     ("girar derecha",    "girar izquierda"),
     ("centrar",          "subir"),
@@ -53,8 +58,10 @@ AYUDA_LCD = [
     ("apuntar arriba",   "apuntar abajo"),
     ("garra horizontal", "garra vertical"),
     ("abrir",            "cerrar"),
+    ("Tecla r:",         "estado inicial"),
 ]
-MENU = ("Enter: hablar", "h:ayuda  q:salir")
+MENU = ("Enter:hab  r:ini", "h:ayuda  q:salir")
+TECLA_INICIO = "r"      # tecla para volver todos los servos a su posición inicial
 
 # --- Movimiento suave ---
 PASO_SUAVE = 2          # grados por paso
@@ -66,9 +73,15 @@ PASO_HOMBRO = 10        # subir / bajar
 PASO_MUNECA = 10        # apuntar arriba / abajo
 CENTRO_BASE = 90        # centrar
 
-CODO_RETRAIDO = 30       # retraer
-CODO_EXTENDIDO = 70    # extender 
-CODO_SEMIFLEXION = (CODO_RETRAIDO + CODO_EXTENDIDO) // 2   # punto medio
+HOMBRO_ARRIBA = 33      # posición más alta del hombro 
+HOMBRO_ABAJO = 98       # máximo de bajada del hombro
+
+MUNECA_MIN = 0          # límite inferior de la muñeca
+MUNECA_MAX = 130        # límite superior de la muñeca
+
+CODO_RETRAIDO = 75      # retraer: estado base (inicio); no sube más de aquí
+CODO_EXTENDIDO = 0      # extender: el codo totalmente estirado
+CODO_SEMIFLEXION = 32
 
 GARRA_HORIZONTAL = 90  
 GARRA_VERTICAL = 10    
@@ -78,12 +91,12 @@ AGARRE_CERRADO = 150    # cerrar
 
 # --- Servos: fila del módulo PWM (1 a 6) = canal (0 a 5) ---
 SERVOS = {
-    "base":     {"fila": 1, "canal": 0, "inicio": 90,               "min": 0, "max": 180},
-    "hombro":   {"fila": 2, "canal": 1, "inicio": 90,               "min": 0, "max": 180},
-    "codo":     {"fila": 3, "canal": 2, "inicio": CODO_RETRAIDO,    "min": 0, "max": CODO_EXTENDIDO},
-    "muneca":   {"fila": 4, "canal": 3, "inicio": 90,               "min": 0, "max": 180},
-    "rotacion": {"fila": 5, "canal": 4, "inicio": GARRA_HORIZONTAL, "min": 0, "max": 180},
-    "agarre":   {"fila": 6, "canal": 5, "inicio": AGARRE_ABIERTO,   "min": 0, "max": 180},
+    "base":     {"fila": 1, "canal": 0, "inicio": 90,               "min": 0,              "max": 180},
+    "hombro":   {"fila": 2, "canal": 1, "inicio": HOMBRO_ARRIBA,    "min": HOMBRO_ARRIBA,  "max": HOMBRO_ABAJO},
+    "codo":     {"fila": 3, "canal": 2, "inicio": CODO_RETRAIDO,    "min": CODO_EXTENDIDO, "max": CODO_RETRAIDO},
+    "muneca":   {"fila": 4, "canal": 3, "inicio": 30,               "min": MUNECA_MIN,     "max": MUNECA_MAX},
+    "rotacion": {"fila": 5, "canal": 4, "inicio": GARRA_HORIZONTAL, "min": 0,              "max": 180},
+    "agarre":   {"fila": 6, "canal": 5, "inicio": AGARRE_ABIERTO,   "min": 0,              "max": 180},
 }
 
 NOMBRES = {"base": "Base", "hombro": "Hombro", "codo": "Codo",
@@ -121,6 +134,7 @@ MIC = MIC_RESPALDO
 SR_MIC = 48000
 pos = {}             # posición actual de cada servo 
 aviso_limite = None  # mensaje de límite
+hilo_reconocimiento = None   # reconocimiento en curso (para el tiempo máximo)
 
 
 # =====================================================================
@@ -257,16 +271,21 @@ class Pantalla:
     def procesando(self):
         self.mensaje("Preparando orden", _centro("espere..."))
 
+    def no_detectado(self):
+        self.mensaje("No se detecto", "repite la orden")
+
     def orden(self, comando):
         self.mensaje("Orden detectada:", _centro(comando.upper()))
 
     def resultado(self, texto, comando):
         """Muestra el resultado unos segundos y vuelve al menú (o se interrumpe con Enter)."""
         def tarea():
-            if not texto:
+            if texto is None:
+                self._escribir("Tiempo agotado", "intenta de nuevo")
+            elif not texto:
                 self._escribir("No se escucho", "intenta de nuevo")
             elif comando is None:
-                self._escribir("No reconocido:", texto)
+                self._escribir(_centro("Comando no"), _centro("detectado"))
             elif aviso_limite:
                 self._escribir("Limite alcanzado", aviso_limite)
             # si el comando fue válido, "Orden detectada" ya está en pantalla
@@ -310,8 +329,51 @@ def a_16k(audio, sr_origen):
     return np.interp(x_new, x_old, audio).astype("float32")
 
 
+def transcribir(audio):
+    """Reconoce el audio con Whisper. Devuelve el texto, o None si pasa de
+    TIEMPO_MAX_RECONOCIMIENTO segundos sin terminar."""
+    global hilo_reconocimiento
+
+    # Si quedó un reconocimiento anterior sin terminar, se espera a que acabe
+    # para no tener dos al mismo tiempo (la Jetson se pondría más lenta)
+    if hilo_reconocimiento is not None and hilo_reconocimiento.is_alive():
+        hilo_reconocimiento.join()
+
+    resultado = {}
+    cancelar = threading.Event()
+
+    def tarea():
+        try:
+            segs, _ = model.transcribe(
+                audio, language="es", beam_size=1, vad_filter=True,
+                initial_prompt=PROMPT_WHISPER,
+                temperature=0.0,                   # sin reintentos internos (son los que más demoran)
+                condition_on_previous_text=False,  # evita que se quede repitiendo texto
+            )
+            partes = []
+            for s in segs:
+                if cancelar.is_set():
+                    return
+                partes.append(s.text)
+            resultado["texto"] = " ".join(partes)
+        except Exception as e:
+            resultado["error"] = e
+
+    hilo_reconocimiento = threading.Thread(target=tarea, daemon=True)
+    hilo_reconocimiento.start()
+    hilo_reconocimiento.join(TIEMPO_MAX_RECONOCIMIENTO)
+
+    if hilo_reconocimiento.is_alive():   # se pasó del tiempo
+        cancelar.set()
+        return None
+    if "error" in resultado:
+        raise resultado["error"]
+    return normalizar(resultado.get("texto", ""))
+
+
 def escuchar():
-    """Cuenta regresiva, graba SEG segundos y transcribe."""
+    """Cuenta regresiva, graba SEG segundos y transcribe.
+    Devuelve (texto, tiempo); texto es None si se pasó del tiempo máximo."""
     for n in range(CUENTA_REGRESIVA, 0, -1):
         print(f"   {n}...")
         pantalla.cuenta(n)
@@ -331,11 +393,7 @@ def escuchar():
     pantalla.procesando()
     t1 = time.time()
     audio = a_16k(audio.flatten(), SR_MIC)
-    segs, _ = model.transcribe(
-        audio, language="es", beam_size=1, vad_filter=True,
-        initial_prompt=PROMPT_WHISPER,
-    )
-    texto = normalizar(" ".join(s.text for s in segs))
+    texto = transcribir(audio)
     return texto, time.time() - t1
 
 
@@ -393,9 +451,11 @@ def ejecutar(c):
     elif c == "centrar":
         mover("base", CENTRO_BASE)
     elif c == "subir":
-        mover("hombro", pos["hombro"] + PASO_HOMBRO)
-    elif c == "bajar":
+        # En este brazo el hombro sube al REDUCIR el ángulo (33° es lo más arriba)
         mover("hombro", pos["hombro"] - PASO_HOMBRO)
+    elif c == "bajar":
+        # y baja al AUMENTAR el ángulo (98° es lo más abajo)
+        mover("hombro", pos["hombro"] + PASO_HOMBRO)
     elif c == "extender":
         mover("codo", CODO_EXTENDIDO)
     elif c == "retraer":
@@ -403,9 +463,11 @@ def ejecutar(c):
     elif c == "semiflexión":
         mover("codo", CODO_SEMIFLEXION)
     elif c == "apuntar arriba":
-        mover("muneca", pos["muneca"] + PASO_MUNECA)
-    elif c == "apuntar abajo":
+        # En este brazo la muñeca sube al REDUCIR el ángulo
         mover("muneca", pos["muneca"] - PASO_MUNECA)
+    elif c == "apuntar abajo":
+        # y baja al AUMENTAR el ángulo
+        mover("muneca", pos["muneca"] + PASO_MUNECA)
     elif c == "garra horizontal":
         mover("rotacion", GARRA_HORIZONTAL)
     elif c == "garra vertical":
@@ -414,6 +476,16 @@ def ejecutar(c):
         mover("agarre", AGARRE_ABIERTO)
     elif c == "cerrar":
         mover("agarre", AGARRE_CERRADO)
+
+
+def ir_a_inicio():
+    """Lleva todos los servos a su posición inicial, uno por uno y de forma suave."""
+    print("Volviendo al estado inicial...")
+    pantalla.mensaje(_centro("Volviendo al"), _centro("estado inicial"))
+    for nombre, s in SERVOS.items():
+        mover(nombre, s["inicio"])
+        time.sleep(0.2)
+    print("   brazo en estado inicial")
 
 
 def mostrar_posiciones():
@@ -428,7 +500,7 @@ def mostrar_ayuda():
     print(" 4 muñeca ....... apuntar arriba | apuntar abajo")
     print(" 5 rotación ..... garra horizontal | garra vertical")
     print(" 6 agarre ....... abrir | cerrar")
-    print("\n Teclado: Enter = hablar | h = ayuda | q = salir")
+    print(f"\n Teclado: Enter = hablar | h = ayuda | {TECLA_INICIO} = estado inicial | q = salir")
 
 
 # =====================================================================
@@ -470,7 +542,8 @@ def main():
 
     while True:
         try:
-            tecla = input("\nEnter para hablar (h = ayuda, q = salir): ").strip().lower()
+            tecla = input(f"\nEnter para hablar (h = ayuda, {TECLA_INICIO} = estado inicial, "
+                          f"q = salir): ").strip().lower()
         except (KeyboardInterrupt, EOFError):
             break
         if tecla == "q":
@@ -479,10 +552,30 @@ def main():
             mostrar_ayuda()
             pantalla.ayuda()
             continue
+        if tecla == TECLA_INICIO:
+            ir_a_inicio()
+            mostrar_posiciones()
+            pantalla.menu()
+            continue
 
         aviso_limite = None
-        texto, t_rec = escuchar()
-        print(f"-> '{texto}'  ({t_rec:.1f}s de reconocimiento)")
+
+        # Si el reconocimiento pasa del tiempo máximo, se vuelve a pedir el comando
+        for intento in range(1, REINTENTOS_MAX + 1):
+            texto, t_rec = escuchar()
+            if texto is not None:
+                break
+            print(f"   pasaron {TIEMPO_MAX_RECONOCIMIENTO} s sin detectar el comando "
+                  f"(intento {intento} de {REINTENTOS_MAX})")
+            if intento < REINTENTOS_MAX:
+                print("   repite el comando")
+                pantalla.no_detectado()
+                time.sleep(1.5)
+
+        if texto is None:
+            print("   no se pudo detectar el comando; presiona Enter para intentar de nuevo")
+            pantalla.resultado(None, None)
+            continue
 
         if not texto:
             print("   no se escuchó nada, intenta de nuevo")
@@ -491,11 +584,11 @@ def main():
 
         comando = buscar_comando(texto)
         if comando is None:
-            print("   comando no reconocido")
+            print("   comando no detectado")
             pantalla.resultado(texto, None)
             continue
 
-        print(f"   comando: {comando}")
+        print(f"   comando: {comando}  ({t_rec:.1f}s de reconocimiento)")
         pantalla.orden(comando)
         ejecutar(comando)
         mostrar_posiciones()
@@ -508,6 +601,5 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 
